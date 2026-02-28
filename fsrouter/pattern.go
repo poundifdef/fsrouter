@@ -209,3 +209,13 @@ func (p *pattern) staticPrefix() string {
 func (p *pattern) depth() int {
 	return len(p.segments)
 }
+
+// hasGlob returns true if this pattern contains a glob segment ({param...}).
+func (p *pattern) hasGlob() bool {
+	for _, seg := range p.segments {
+		if seg.isGlob {
+			return true
+		}
+	}
+	return false
+}

@@ -1,20 +1,22 @@
 # fsrouter
 
-**Build virtual filesystems as easily as HTTP routes.**
-
-`fsrouter` maps the familiar HTTP router pattern onto filesystem operations. Just as `net/http` lets you register handlers for URL paths with verbs like GET, POST, DELETE — `fsrouter` lets you register handlers for file paths with verbs like **Read**, **Write**, **List**, **Remove**.
-
-The result is served over **NFSv3** via [`go-nfs`](https://github.com/willscott/go-nfs) and can be mounted by any standard NFS client.
+An HTTP-router-style API for building virtual filesystems served over NFS.
 
 ```
- HTTP                          Filesystem
-┌──────────────────────┐      ┌──────────────────────────┐
-│ GET    /users/:id    │  ──▶ │ Read   /users/{id}.json  │
-│ POST   /users/:id    │  ──▶ │ Write  /users/{id}.json  │
-│ HEAD   /users/:id    │  ──▶ │ Stat   /users/{id}.json  │
-│ DELETE /users/:id    │  ──▶ │ Remove /users/{id}.json  │
-│ GET    /users/       │  ──▶ │ List   /users/           │
-└──────────────────────┘      └──────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│               Your Go code                      │
+│   Read / Write / Create / Stat / List / …       │
+│   router.Read("/users/{id}.json", handler)      │
+├─────────────────────────────────────────────────┤
+│               fsrouter                          │
+│   pattern matching · implicit dirs · VFS        │
+├─────────────────────────────────────────────────┤
+│               go-nfs (NFSv3)                    │
+│   wire protocol · file handles · caching        │
+├─────────────────────────────────────────────────┤
+│               NFS client                        │
+│   mount -t nfs ... / Finder / Explorer          │
+└─────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -23,201 +25,127 @@ The result is served over **NFSv3** via [`go-nfs`](https://github.com/willscott/
 package main
 
 import (
-    "encoding/json"
-    "log"
+    "net"
     "github.com/yourorg/fsrouter"
 )
 
 func main() {
     router := fsrouter.New()
 
-    // READ — like HTTP GET
-    router.Read("/hello.txt", func(c *fsrouter.Context) ([]byte, error) {
-        return []byte("Hello, World!\n"), nil
+    router.Read("/hello.txt", func(c *fsrouter.Context, offset int64, length int) ([]byte, error) {
+        data := []byte("Hello, world!\n")
+        return data[offset:min(offset+int64(length), int64(len(data)))], nil
     })
 
-    // READ with path parameters — like /users/:id
-    router.Read("/users/{id}.json", func(c *fsrouter.Context) ([]byte, error) {
-        user := getUser(c.Param("id"))
-        return json.Marshal(user)
-    })
-
-    // WRITE — like HTTP PUT/POST
-    router.Write("/users/{id}.json", func(c *fsrouter.Context, data []byte) error {
-        var user User
-        json.Unmarshal(data, &user)
-        return saveUser(c.Param("id"), user)
-    })
-
-    // LIST — like HTTP GET on a collection
-    router.List("/users/", func(c *fsrouter.Context) ([]fsrouter.DirEntry, error) {
-        names := listUserIDs()
-        entries := make([]fsrouter.DirEntry, len(names))
-        for i, n := range names {
-            entries[i] = fsrouter.DirEntry{Name: n + ".json", Size: 100}
-        }
-        return entries, nil
-    })
-
-    // REMOVE — like HTTP DELETE
-    router.Remove("/users/{id}.json", func(c *fsrouter.Context) error {
-        return deleteUser(c.Param("id"))
-    })
-
-    log.Fatal(router.Serve(":2049"))
+    ln, _ := net.Listen("tcp", ":2049")
+    router.ServeListener(ln)
 }
 ```
 
 Mount it:
-
 ```bash
-# macOS
-mkdir -p /tmp/mnt
-mount -o port=2049,mountport=2049,nfsvers=3,noacl,tcp -t nfs localhost:/mount /tmp/mnt
-
-# Linux
-mkdir -p /tmp/mnt
-mount -o port=2049,mountport=2049,vers=3,tcp -t nfs localhost:/ /tmp/mnt
+sudo mount -t nfs -o port=2049,mountport=2049,nfsvers=3,tcp,nolock 127.0.0.1:/ ./m
+cat ./m/hello.txt   # Hello, world!
 ```
 
-Now use standard tools:
+## Verbs
 
-```bash
-ls /tmp/mnt/users/              # → alice.json  bob.json
-cat /tmp/mnt/users/alice.json   # → {"name":"alice","role":"admin"}
-echo '{"role":"new"}' > /tmp/mnt/users/dave.json   # Creates a user
-rm /tmp/mnt/users/bob.json      # Deletes a user
-cat /tmp/mnt/hello.txt          # → Hello, World!
-```
+Each verb maps directly to a POSIX syscall:
 
-## Verb Reference
+| Verb       | Signature                                                    | Syscall     |
+|------------|--------------------------------------------------------------|-------------|
+| **Read**   | `func(c *Context, offset int64, length int) ([]byte, error)` | pread(2)    |
+| **Write**  | `func(c *Context, data []byte, offset int64) error`          | pwrite(2)   |
+| **Create** | `func(c *Context, data []byte) error`                        | creat(2)    |
+| **Stat**   | `func(c *Context) (*FileStat, error)`                        | stat(2)     |
+| **List**   | `func(c *Context) ([]DirEntry, error)`                       | readdir(3)  |
+| **Remove** | `func(c *Context) error`                                     | unlink(2)   |
+| **Mkdir**  | `func(c *Context) error`                                     | mkdir(2)    |
+| **Rename** | `func(c *Context, newPath string) error`                     | rename(2)   |
 
-| Verb       | Signature                                              | Filesystem Op   | HTTP Equivalent |
-|------------|--------------------------------------------------------|-----------------|-----------------|
-| **Read**   | `func(c *Context) ([]byte, error)`                     | `open` + `read` | GET             |
-| **Write**  | `func(c *Context, data []byte) error`                  | `write`+`close` | PUT / POST      |
-| **Stat**   | `func(c *Context) (*FileStat, error)`                  | `stat`          | HEAD            |
-| **List**   | `func(c *Context) ([]DirEntry, error)`                 | `readdir`       | GET (collection)|
-| **Remove** | `func(c *Context) error`                               | `unlink`        | DELETE          |
-| **Create** | `func(c *Context) error`                               | `create`        | POST (create)   |
-| **Mkdir**  | `func(c *Context) error`                               | `mkdir`         | MKCOL           |
-| **Rename** | `func(c *Context, newPath string) error`               | `rename`        | MOVE            |
+**Read** is called for every NFS READ RPC with the byte offset and requested length.
+**Write** is called for every NFS WRITE RPC with the data and its byte offset. For existing files only.
+**Create** is called once when a new file is created, with the complete buffered contents.
 
-## Path Patterns
-
-Patterns follow the same conventions as HTTP routers:
+## Patterns
 
 ```go
-"/config.json"          // Exact match
-"/users/{id}"           // Captures path segment into "id"
-"/users/{id}.json"      // Captures "alice" from "alice.json"
-"/files/{path...}"      // Glob — captures "a/b/c" from "/files/a/b/c"
-"/users/"               // Directory (trailing slash) — used with List
+router.Read("/readme.txt", handler)                    // exact path
+router.Read("/users/{id}.json", handler)               // path parameter
+router.Read("/orgs/{org}/users/{id}.json", handler)    // multiple parameters
+router.Read("/echo/{path...}", handler)                // catch-all glob
 ```
 
-## Route Groups
+Access parameters via `c.Param("id")`.
 
-Group routes under a shared prefix, exactly like HTTP sub-routers:
+## CRUD Example
+
+```go
+router.Read("/users/{id}.json", func(c *fsrouter.Context, offset int64, length int) ([]byte, error) {
+    data, _ := json.Marshal(db.Get(c.Param("id")))
+    end := offset + int64(length)
+    if end > int64(len(data)) { end = int64(len(data)) }
+    return data[offset:end], nil
+})
+
+router.Stat("/users/{id}.json", func(c *fsrouter.Context) (*fsrouter.FileStat, error) {
+    size := db.Size(c.Param("id"))
+    return &fsrouter.FileStat{Size: size}, nil
+})
+
+router.Create("/users/{id}.json", func(c *fsrouter.Context, data []byte) error {
+    return db.Insert(c.Param("id"), data)
+})
+
+router.Write("/users/{id}.json", func(c *fsrouter.Context, data []byte, offset int64) error {
+    return db.Put(c.Param("id"), data)
+})
+
+router.Remove("/users/{id}.json", func(c *fsrouter.Context) error {
+    return db.Delete(c.Param("id"))
+})
+
+router.List("/users/", func(c *fsrouter.Context) ([]fsrouter.DirEntry, error) {
+    return db.ListUsers()
+})
+```
+
+### Stat
+
+If you don't register a Stat handler, fsrouter synthesizes one:
+- Read handler exists → returns size 0 (can't know without reading).
+- Implicit directory → returns directory info.
+
+Register a Stat handler when clients need accurate file sizes (e.g. for `ls -l` or seeking).
+
+### Create vs Write
+
+Create is for new files. Write is for existing files.
+
+- **Create** buffers all writes and delivers the complete contents to your handler.
+  Good for small files like JSON, config, etc.
+- **Write** is called per NFS WRITE RPC with data + offset (pwrite semantics).
+  Good for large files, append logs, or anything where you need offset control.
+
+The NFS protocol lifecycle for a new file:
+
+1. `CREATE` RPC → file marked as pending
+2. `WRITE` RPC(s) → data buffered (if Create handler) or delivered per-chunk (if only Write handler)
+3. Client closes → Create handler called with complete data, pending cleared
+
+For overwriting existing files, only Write is called (no Create).
+
+If you register both Create and Write for the same pattern, Create handles new files and Write handles overwrites. If you only register Write, it handles both.
+
+## Groups
 
 ```go
 api := router.Group("/api/v1")
-api.Read("/status.json", statusHandler)    // /api/v1/status.json
-api.List("/users/", listUsersHandler)      // /api/v1/users/
-
-admin := api.Group("/admin")
-admin.Read("/config.json", configHandler)  // /api/v1/admin/config.json
-```
-
-## Middleware
-
-Add cross-cutting concerns just like HTTP middleware:
-
-```go
-router.Use(func(verb fsrouter.Verb, path string, next func() error) error {
-    start := time.Now()
-    err := next()
-    log.Printf("[%v] %s took %v", verb, path, time.Since(start))
-    return err
-})
+api.Read("/status.json", statusHandler)   // → /api/v1/status.json
+api.Write("/config.json", configHandler)  // → /api/v1/config.json
 ```
 
 ## Implicit Directories
 
-Registering any route implicitly creates its parent directories. If you register:
-
-```go
-router.Read("/a/b/c.json", handler)
-```
-
-Then `ls /`, `ls /a/`, and `ls /a/b/` all work automatically. The directories `/`, `/a/`, and `/a/b/` are synthesized from the route tree without needing explicit `List` handlers.
-
-To provide **dynamic** directory listings (where entries come from a database, API, etc.), register an explicit `List` handler:
-
-```go
-router.List("/a/b/", func(c *fsrouter.Context) ([]fsrouter.DirEntry, error) {
-    // Return entries from your data source
-})
-```
-
-## Stat Inference
-
-If you don't register an explicit `Stat` handler, `fsrouter` infers file metadata automatically:
-
-1. For files with a `Read` handler: calls the handler and uses the result length as the file size
-2. For files with only a `Write` handler: reports size 0
-3. For directories: reports standard directory metadata (mode 0755, size 4096)
-
-Register a `Stat` handler when calling `Read` is expensive and you can provide metadata more cheaply:
-
-```go
-router.Stat("/large-files/{id}", func(c *fsrouter.Context) (*fsrouter.FileStat, error) {
-    size, _ := db.GetFileSize(c.Param("id"))
-    return &fsrouter.FileStat{Size: size}, nil
-})
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                  NFS Client                     │
-│          (mount, ls, cat, echo, rm)             │
-└───────────────────┬─────────────────────────────┘
-                    │ NFSv3 protocol
-┌───────────────────▼─────────────────────────────┐
-│              go-nfs server                      │
-│         (willscott/go-nfs)                      │
-└───────────────────┬─────────────────────────────┘
-                    │ billy.Filesystem interface
-┌───────────────────▼─────────────────────────────┐
-│                VFS layer                        │
-│   Dispatches billy operations to matched routes │
-└───────────────────┬─────────────────────────────┘
-                    │ pattern matching
-┌───────────────────▼─────────────────────────────┐
-│                Router                           │
-│   Read / Write / Stat / List / Remove / ...     │
-│   Path patterns: /users/{id}.json               │
-│   Groups: router.Group("/api/v1")               │
-│   Middleware chain                              │
-└───────────────────┬─────────────────────────────┘
-                    │ your handler functions
-┌───────────────────▼─────────────────────────────┐
-│            Your Application Logic               │
-│   (databases, APIs, generators, etc.)           │
-└─────────────────────────────────────────────────┘
-```
-
-## Use Cases
-
-- **Database-as-a-filesystem**: Expose database records as JSON files
-- **API gateway**: Mount a REST API as a local filesystem
-- **Config management**: Virtual config files backed by etcd/Consul
-- **Build systems**: Generate files on-the-fly from templates
-- **Dev tools**: Hot-reload virtual assets during development
-- **IoT dashboards**: Sensor readings as readable files
-- **Log aggregation**: Stream logs by reading virtual files
-
-## License
-
-Apache 2.0
+Registering `/a/b/c.json` automatically makes `/`, `/a`, and `/a/b` appear as directories.
+No Mkdir handler needed for intermediate paths.
