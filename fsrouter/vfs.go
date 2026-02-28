@@ -105,7 +105,17 @@ func (v *VFS) Stat(filename string) (os.FileInfo, error) {
 func (v *VFS) stat(filename string) (os.FileInfo, error) {
 	filename = v.clean(filename)
 
-	// 1. Explicit stat handler.
+	// 1. Pending file — just created, not yet written. Must be visible
+	//    before any handler checks so that NFS SETATTR after CREATE succeeds.
+	if v.router.isPending(filename) {
+		return v.statToInfo(filename, &FileStat{
+			Size:    0,
+			Mode:    0644,
+			ModTime: v.router.bootTime,
+		}), nil
+	}
+
+	// 2. Explicit stat handler.
 	if handler, ctx := v.router.resolve(VerbStat, filename); handler != nil {
 		stat, err := handler.(StatHandler)(ctx)
 		if err != nil {
@@ -114,17 +124,17 @@ func (v *VFS) stat(filename string) (os.FileInfo, error) {
 		return v.statToInfo(filename, stat), nil
 	}
 
-	// 2. Implicit directory.
+	// 3. Implicit directory.
 	if v.router.isImplicitDir(filename) {
 		return v.dirInfo(filename), nil
 	}
 
-	// 3. List handler → directory.
+	// 4. List handler → directory.
 	if handler, _ := v.router.resolve(VerbList, filename+"/"); handler != nil {
 		return v.dirInfo(filename), nil
 	}
 
-	// 4. Read handler → file exists; call the handler to determine size.
+	// 5. Read handler → file exists; call the handler to determine size.
 	if handler, ctx := v.router.resolve(VerbRead, filename); handler != nil {
 		size := int64(0)
 		if data, err := handler.(ReadHandler)(ctx, 0, math.MaxInt); err == nil {
@@ -133,16 +143,7 @@ func (v *VFS) stat(filename string) (os.FileInfo, error) {
 		return v.statToInfo(filename, &FileStat{
 			Size:    size,
 			Mode:    0644,
-			ModTime: time.Now(),
-		}), nil
-	}
-
-	// 5. Pending file.
-	if v.router.isPending(filename) {
-		return v.statToInfo(filename, &FileStat{
-			Size:    0,
-			Mode:    0644,
-			ModTime: time.Now(),
+			ModTime: v.router.bootTime,
 		}), nil
 	}
 
@@ -287,7 +288,7 @@ func (v *VFS) statToInfo(name string, stat *FileStat) os.FileInfo {
 	}
 	modTime := stat.ModTime
 	if modTime.IsZero() {
-		modTime = time.Now()
+		modTime = v.router.bootTime
 	}
 	return &fileInfo{
 		name: path.Base(name),
@@ -310,7 +311,7 @@ func (v *VFS) dirInfo(dirPath string) os.FileInfo {
 		stat: FileStat{
 			Size:    4096,
 			Mode:    os.ModeDir | 0755,
-			ModTime: time.Now(),
+			ModTime: v.router.bootTime,
 			IsDir:   true,
 		},
 	}

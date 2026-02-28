@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	nfs "github.com/willscott/go-nfs"
@@ -51,6 +52,11 @@ type Router struct {
 	pendingMu    sync.Mutex
 	pendingFiles map[string]bool
 
+	// bootTime is a stable timestamp used as the default ModTime for all
+	// synthetic file/directory stats. Using a fixed time prevents NFS clients
+	// (and editors like vim) from seeing the mtime change on every Lstat poll.
+	bootTime time.Time
+
 	// Middleware applied to every handler invocation.
 	middleware []Middleware
 
@@ -87,6 +93,7 @@ func New() *Router {
 			children: make(map[string]*dirNode),
 		},
 		pendingFiles:    make(map[string]bool),
+		bootTime:        time.Now(),
 		HandleCacheSize: 1024,
 		Logger:          zerolog.Nop(),
 	}
