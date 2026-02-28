@@ -294,6 +294,26 @@ func (r *Router) isPending(path string) bool {
 	return r.pendingFiles[path]
 }
 
+// pendingChildren returns the base names of pending files directly under dirPath.
+func (r *Router) pendingChildren(dirPath string) []string {
+	prefix := dirPath + "/"
+	if dirPath == "/" {
+		prefix = "/"
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	var names []string
+	for p := range r.pendingFiles {
+		if strings.HasPrefix(p, prefix) {
+			rest := p[len(prefix):]
+			if rest != "" && !strings.Contains(rest, "/") {
+				names = append(names, rest)
+			}
+		}
+	}
+	return names
+}
+
 // --------------------------------------------------------------------------
 // Internal route management
 // --------------------------------------------------------------------------

@@ -209,9 +209,24 @@ func (v *VFS) ReadDir(dirPath string) ([]os.FileInfo, error) {
 		if err != nil {
 			return nil, err
 		}
-		infos := make([]os.FileInfo, len(entries))
-		for i, e := range entries {
-			infos[i] = &dirEntryInfo{entry: e}
+		infos := make([]os.FileInfo, 0, len(entries))
+		seen := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			infos = append(infos, &dirEntryInfo{entry: e})
+			seen[e.Name] = true
+		}
+		// Include pending files not already in the listing.
+		for _, name := range v.router.pendingChildren(dirPath) {
+			if !seen[name] {
+				infos = append(infos, &fileInfo{
+					name: name,
+					stat: FileStat{
+						Size:    0,
+						Mode:    0644,
+						ModTime: v.router.bootTime,
+					},
+				})
+			}
 		}
 		return infos, nil
 	}
