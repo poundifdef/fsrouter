@@ -74,7 +74,9 @@ func (f *bufferedFile) Close() error {
 	if f.handler != nil {
 		err = f.handler(f.ctx, f.buf)
 	}
-	if f.onClose != nil {
+	// Only run cleanup (remove pending) when the handler succeeded.
+	// If the handler failed, keep the file pending so the client can retry.
+	if err == nil && f.onClose != nil {
 		f.onClose()
 	}
 	return err
