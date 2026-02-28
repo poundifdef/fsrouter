@@ -93,6 +93,8 @@ func (v *VFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 		if handler, ctx := v.router.resolve(VerbWrite, filename); handler != nil {
 			return newWriteFile(filename, handler.(WriteHandler), ctx), nil
 		}
+
+		return nil, os.ErrPermission
 	}
 
 	// Read path.
