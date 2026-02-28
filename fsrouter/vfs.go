@@ -2,6 +2,7 @@ package fsrouter
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"sort"
@@ -123,10 +124,14 @@ func (v *VFS) stat(filename string) (os.FileInfo, error) {
 		return v.dirInfo(filename), nil
 	}
 
-	// 4. Read handler → file exists (size unknown without Stat handler).
-	if handler, _ := v.router.resolve(VerbRead, filename); handler != nil {
+	// 4. Read handler → file exists; call the handler to determine size.
+	if handler, ctx := v.router.resolve(VerbRead, filename); handler != nil {
+		size := int64(0)
+		if data, err := handler.(ReadHandler)(ctx, 0, math.MaxInt); err == nil {
+			size = int64(len(data))
+		}
 		return v.statToInfo(filename, &FileStat{
-			Size:    0,
+			Size:    size,
 			Mode:    0644,
 			ModTime: time.Now(),
 		}), nil
