@@ -174,6 +174,14 @@ func (v *VFS) Rename(oldpath, newpath string) error {
 func (v *VFS) Remove(filename string) error {
 	filename = v.clean(filename)
 
+	// Pending files can be removed without a handler — they haven't been
+	// committed yet. This handles macOS resource fork files (._*) that get
+	// created and immediately removed.
+	if v.router.isPending(filename) {
+		v.router.removePending(filename)
+		return nil
+	}
+
 	handler, ctx := v.router.resolve(VerbRemove, filename)
 	if handler == nil {
 		return os.ErrPermission
