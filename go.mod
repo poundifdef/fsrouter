@@ -1,6 +1,6 @@
 module f
 
-go 1.25
+go 1.26
 
 require (
 	github.com/go-git/go-billy/v5 v5.6.0

@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
 	"sync"
+	"syscall"
 
 	"github.com/rs/zerolog"
 
@@ -27,6 +31,12 @@ var (
 )
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s <mountpoint>\n", os.Args[0])
+		os.Exit(1)
+	}
+	mountpoint := os.Args[1]
+
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
 		With().Timestamp().Logger()
 
@@ -130,16 +140,82 @@ func main() {
 		return sliceRange(data, offset, length), nil
 	})
 
-	// --- Serve ---
+	// --- Serve and mount ---
 
-	listener, err := net.Listen("tcp", "127.0.0.1:2049")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to listen")
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	fmt.Printf("Serving NFS on 127.0.0.1:%d\n", port)
-	fmt.Printf("Mount with: sudo mount -t nfs -o port=%d,mountport=%d,nfsvers=3,tcp,nolock 127.0.0.1:/ /mnt/point\n", port, port)
-	logger.Fatal().Err(router.ServeListener(listener)).Msg("server exited")
+
+	// Start NFS server in background.
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- router.ServeListener(listener)
+	}()
+
+	// Mount the NFS filesystem.
+	if err := nfsMount(mountpoint, port); err != nil {
+		listener.Close()
+		logger.Fatal().Err(err).Msg("failed to mount")
+	}
+	logger.Info().Str("mountpoint", mountpoint).Int("port", port).Msg("mounted")
+
+	// Wait for SIGINT/SIGTERM.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case s := <-sig:
+		logger.Info().Str("signal", s.String()).Msg("shutting down")
+	case err := <-serverErr:
+		logger.Error().Err(err).Msg("server exited unexpectedly")
+	}
+
+	// Unmount and stop.
+	if err := nfsUnmount(mountpoint); err != nil {
+		logger.Error().Err(err).Msg("failed to unmount")
+	} else {
+		logger.Info().Str("mountpoint", mountpoint).Msg("unmounted")
+	}
+	listener.Close()
+}
+
+func nfsMount(mountpoint string, port int) error {
+	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+		return err
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("mount", "-t", "nfs",
+			"-o", fmt.Sprintf("port=%d,mountport=%d,nfsvers=3,tcp,nolock", port, port),
+			"127.0.0.1:/", mountpoint)
+	case "linux":
+		cmd = exec.Command("mount", "-t", "nfs",
+			"-o", fmt.Sprintf("port=%d,mountport=%d,nfsvers=3,tcp,nolock,addr=127.0.0.1", port, port),
+			"127.0.0.1:/", mountpoint)
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func nfsUnmount(mountpoint string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("umount", mountpoint)
+	case "linux":
+		cmd = exec.Command("umount", "-l", mountpoint)
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // sliceRange is a helper for implementing ReadHandler on in-memory data.
