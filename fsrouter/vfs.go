@@ -60,6 +60,14 @@ func (v *VFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 
 	isWrite := flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0
 
+	// NFS SETATTR uses O_WRONLY|O_EXCL to truncate a file after CREATE.
+	// For pending files this is just an attribute-setting operation, not a
+	// real data write — return a no-op so we don't prematurely consume the
+	// pending entry or fire the Create handler with empty data.
+	if isWrite && v.router.isPending(filename) && flag&os.O_EXCL != 0 && flag&os.O_CREATE == 0 {
+		return newNoOpFile(filename), nil
+	}
+
 	if isWrite {
 		pending := v.router.isPending(filename)
 		router := v.router
