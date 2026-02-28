@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
+	"os"
 	"sync"
+
+	"github.com/rs/zerolog"
 
 	"f/fsrouter"
 )
@@ -25,7 +27,14 @@ var (
 )
 
 func main() {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
+		With().Timestamp().Logger()
+
 	router := fsrouter.New()
+	router.Logger = logger
+
+	// Add logging middleware for all handler invocations.
+	router.Use(fsrouter.LoggingMiddleware(logger.With().Str("layer", "handler").Logger()))
 
 	// --- Static files ---
 
@@ -85,7 +94,7 @@ func main() {
 			return fmt.Errorf("user %s already exists", u.ID)
 		}
 		users[u.ID] = &u
-		log.Printf("CREATE /users/%s.json (%d bytes)", u.ID, len(data))
+		logger.Info().Str("id", u.ID).Int("bytes", len(data)).Msg("created user")
 		return nil
 	})
 
@@ -98,7 +107,7 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 		users[u.ID] = &u
-		log.Printf("WRITE /users/%s.json at offset %d (%d bytes)", u.ID, offset, len(data))
+		logger.Info().Str("id", u.ID).Int64("offset", offset).Int("bytes", len(data)).Msg("wrote user")
 		return nil
 	})
 
@@ -110,7 +119,7 @@ func main() {
 			return fmt.Errorf("not found")
 		}
 		delete(users, id)
-		log.Printf("REMOVE /users/%s.json", id)
+		logger.Info().Str("id", id).Msg("removed user")
 		return nil
 	})
 
@@ -125,12 +134,12 @@ func main() {
 
 	listener, err := net.Listen("tcp", "127.0.0.1:2049")
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal().Err(err).Msg("failed to listen")
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	fmt.Printf("Serving NFS on 127.0.0.1:%d\n", port)
 	fmt.Printf("Mount with: sudo mount -t nfs -o port=%d,mountport=%d,nfsvers=3,tcp,nolock 127.0.0.1:/ /mnt/point\n", port, port)
-	log.Fatal(router.ServeListener(listener))
+	logger.Fatal().Err(router.ServeListener(listener)).Msg("server exited")
 }
 
 // sliceRange is a helper for implementing ReadHandler on in-memory data.

@@ -2,12 +2,12 @@ package fsrouter
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"path"
 	"strings"
 	"sync"
 
+	"github.com/rs/zerolog"
 	nfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 )
@@ -54,8 +54,8 @@ type Router struct {
 	// Middleware applied to every handler invocation.
 	middleware []Middleware
 
-	// Logger for filesystem operations. Defaults to log.Default().
-	Logger *log.Logger
+	// Logger for filesystem operations.
+	Logger zerolog.Logger
 
 	// HandleCacheSize controls how many NFS file handles are cached.
 	// Defaults to 1024.
@@ -88,7 +88,7 @@ func New() *Router {
 		},
 		pendingFiles:    make(map[string]bool),
 		HandleCacheSize: 1024,
-		Logger:          log.Default(),
+		Logger:          zerolog.Nop(),
 	}
 }
 
@@ -250,11 +250,12 @@ func (r *Router) Serve(addr string) error {
 // ServeListener starts an NFS server on an existing net.Listener.
 // This is useful when you need control over the listener (e.g., for testing).
 func (r *Router) ServeListener(listener net.Listener) error {
-	fs := r.Filesystem()
-	handler := nfshelper.NewNullAuthHandler(fs)
+	vfs := r.Filesystem()
+	loggingVFS := NewLoggingVFS(vfs, r.Logger.With().Str("layer", "vfs").Logger())
+	handler := nfshelper.NewNullAuthHandler(loggingVFS)
 	cacheHandler := nfshelper.NewCachingHandler(handler, r.HandleCacheSize)
 
-	r.Logger.Printf("fsrouter: NFS server listening on %s", listener.Addr())
+	r.Logger.Info().Str("addr", listener.Addr().String()).Msg("NFS server listening")
 	return nfs.Serve(listener, cacheHandler)
 }
 

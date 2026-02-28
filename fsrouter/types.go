@@ -34,6 +34,24 @@ const (
 	VerbRename
 )
 
+var verbNames = [...]string{
+	VerbRead:   "READ",
+	VerbWrite:  "WRITE",
+	VerbStat:   "STAT",
+	VerbRemove: "REMOVE",
+	VerbList:   "LIST",
+	VerbCreate: "CREATE",
+	VerbMkdir:  "MKDIR",
+	VerbRename: "RENAME",
+}
+
+func (v Verb) String() string {
+	if int(v) < len(verbNames) {
+		return verbNames[v]
+	}
+	return "UNKNOWN"
+}
+
 // DirEntry describes a single entry returned by a List handler.
 // It is the filesystem equivalent of an item in an HTTP collection response.
 type DirEntry struct {
