@@ -2,6 +2,7 @@ package fsrouter
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"sort"
@@ -12,55 +13,45 @@ import (
 )
 
 // VFS implements billy.Filesystem by dispatching operations to the
-// Router's registered handlers. This is the bridge between NFS protocol
-// operations and your handler functions.
+// Router's registered handlers.
 type VFS struct {
 	router *Router
 }
 
 var _ billy.Filesystem = (*VFS)(nil)
+var _ billy.Change = (*VFS)(nil)
 
 // --------------------------------------------------------------------------
 // billy.Basic
 // --------------------------------------------------------------------------
 
-// Create creates a new file. If a CreateHandler is registered, it is called first.
-// The returned File buffers writes and delivers them to the WriteHandler on Close().
+// Create is called by the NFS CREATE RPC. go-nfs immediately Close()s the
+// returned file — actual data arrives later in WRITE RPCs via OpenFile.
 func (v *VFS) Create(filename string) (billy.File, error) {
 	filename = v.clean(filename)
 
-	// Check for create handler.
-	if handler, ctx := v.router.resolve(VerbCreate, filename); handler != nil {
-		if err := handler.(CreateHandler)(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	// Find a write handler.
-	handler, ctx := v.router.resolve(VerbWrite, filename)
-	if handler == nil {
+	// Must have a Create or Write handler to accept data.
+	hasCreate, _ := v.router.resolve(VerbCreate, filename)
+	hasWrite, _ := v.router.resolve(VerbWrite, filename)
+	if hasCreate == nil && hasWrite == nil {
 		return nil, os.ErrPermission
 	}
 
-	return newWriteFile(filename, handler.(WriteHandler), ctx), nil
+	v.router.addPending(filename)
+	return newNoOpFile(filename), nil
 }
 
 // Open opens an existing file for reading.
 func (v *VFS) Open(filename string) (billy.File, error) {
 	filename = v.clean(filename)
 
-	handler, ctx := v.router.resolve(VerbRead, filename)
-	if handler == nil {
-		// Check if it's a directory — NFS sometimes opens directories.
-		if v.router.isImplicitDir(filename) {
-			return newReadFile(filename, func(c *Context) ([]byte, error) {
-				return nil, nil
-			}, newContext(filename, nil)), nil
-		}
-		return nil, os.ErrNotExist
+	if handler, ctx := v.router.resolve(VerbRead, filename); handler != nil {
+		return newReadFile(filename, handler.(ReadHandler), ctx), nil
 	}
-
-	return newReadFile(filename, handler.(ReadHandler), ctx), nil
+	if v.router.isImplicitDir(filename) || v.router.isPending(filename) {
+		return newNoOpFile(filename), nil
+	}
+	return nil, os.ErrNotExist
 }
 
 // OpenFile opens a file with the given flags and permissions.
@@ -68,103 +59,101 @@ func (v *VFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 	filename = v.clean(filename)
 
 	isWrite := flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0
-	isRead := flag&os.O_WRONLY == 0 // O_RDONLY is 0, so anything without O_WRONLY can read.
 
-	var rh ReadHandler
-	var rctx *Context
-	var wh WriteHandler
-	var wctx *Context
-
-	if isRead {
-		if h, c := v.router.resolve(VerbRead, filename); h != nil {
-			rh = h.(ReadHandler)
-			rctx = c
-		}
+	// NFS SETATTR uses O_WRONLY|O_EXCL to truncate a file after CREATE.
+	// For pending files this is just an attribute-setting operation, not a
+	// real data write — return a no-op so we don't prematurely consume the
+	// pending entry or fire the Create handler with empty data.
+	if isWrite && v.router.isPending(filename) && flag&os.O_EXCL != 0 && flag&os.O_CREATE == 0 {
+		return newNoOpFile(filename), nil
 	}
 
 	if isWrite {
-		// Check create handler for new files.
-		if flag&os.O_CREATE != 0 {
-			if h, c := v.router.resolve(VerbCreate, filename); h != nil {
-				if err := h.(CreateHandler)(c); err != nil {
-					return nil, err
-				}
+		pending := v.router.isPending(filename)
+		router := v.router
+		cleanup := func() { router.removePending(filename) }
+
+		if pending {
+			// New file: buffer writes, deliver to Create handler on close.
+			if handler, ctx := v.router.resolve(VerbCreate, filename); handler != nil {
+				f := newBufferedFile(filename, handler.(CreateHandler), ctx)
+				f.onClose = cleanup
+				return f, nil
 			}
+			// No Create handler but Write handler exists: use ranged write.
+			if handler, ctx := v.router.resolve(VerbWrite, filename); handler != nil {
+				f := newWriteFile(filename, handler.(WriteHandler), ctx)
+				f.onClose = cleanup
+				return f, nil
+			}
+			return newNoOpFile(filename), nil
 		}
 
-		if h, c := v.router.resolve(VerbWrite, filename); h != nil {
-			wh = h.(WriteHandler)
-			wctx = c
+		// Existing file: pwrite per chunk.
+		if handler, ctx := v.router.resolve(VerbWrite, filename); handler != nil {
+			return newWriteFile(filename, handler.(WriteHandler), ctx), nil
 		}
+
+		return nil, os.ErrPermission
 	}
 
-	if rh == nil && wh == nil {
-		// Check if it's a directory.
-		if v.router.isImplicitDir(filename) {
-			return newReadFile(filename, func(c *Context) ([]byte, error) {
-				return nil, nil
-			}, newContext(filename, nil)), nil
-		}
-		return nil, os.ErrNotExist
+	// Read path.
+	if handler, ctx := v.router.resolve(VerbRead, filename); handler != nil {
+		return newReadFile(filename, handler.(ReadHandler), ctx), nil
 	}
-
-	if rh != nil && wh != nil {
-		return newReadWriteFile(filename, rh, rctx, wh, wctx), nil
+	if v.router.isImplicitDir(filename) || v.router.isPending(filename) {
+		return newNoOpFile(filename), nil
 	}
-	if wh != nil {
-		return newWriteFile(filename, wh, wctx), nil
-	}
-	return newReadFile(filename, rh, rctx), nil
+	return nil, os.ErrNotExist
 }
 
-// Stat returns file information. It checks handlers in order:
-// 1. Explicit StatHandler
-// 2. If it's an implicit directory, return directory info
-// 3. Fall back to calling the ReadHandler to determine size
+// Stat returns file information.
 func (v *VFS) Stat(filename string) (os.FileInfo, error) {
-	filename = v.clean(filename)
 	return v.stat(filename)
 }
 
 func (v *VFS) stat(filename string) (os.FileInfo, error) {
-	// 1. Check explicit stat handler.
+	filename = v.clean(filename)
+
+	// 1. Pending file — just created, not yet written. Must be visible
+	//    before any handler checks so that NFS SETATTR after CREATE succeeds.
+	if v.router.isPending(filename) {
+		return v.statToInfo(filename, &FileStat{
+			Size:    0,
+			Mode:    0644,
+			ModTime: v.router.bootTime,
+		}), nil
+	}
+
+	// 2. Explicit stat handler.
 	if handler, ctx := v.router.resolve(VerbStat, filename); handler != nil {
 		stat, err := handler.(StatHandler)(ctx)
 		if err != nil {
-			return nil, err
+			return nil, os.ErrNotExist
 		}
 		return v.statToInfo(filename, stat), nil
 	}
 
-	// 2. Check if it's an implicit directory.
+	// 3. Implicit directory.
 	if v.router.isImplicitDir(filename) {
 		return v.dirInfo(filename), nil
 	}
 
-	// 3. Check if there's a List handler that matches (for directory-like paths).
+	// 4. List handler → directory.
 	if handler, _ := v.router.resolve(VerbList, filename+"/"); handler != nil {
 		return v.dirInfo(filename), nil
 	}
 
-	// 4. Fall back to the read handler to infer file size.
+	// 5. Read handler → file exists; call the handler to determine size.
 	if handler, ctx := v.router.resolve(VerbRead, filename); handler != nil {
-		data, err := handler.(ReadHandler)(ctx)
-		if err != nil {
-			return nil, err
+		size := int64(0)
+		if data, err := handler.(ReadHandler)(ctx, 0, math.MaxInt); err == nil {
+			size = int64(len(data))
 		}
 		return v.statToInfo(filename, &FileStat{
-			Size:    int64(len(data)),
+			Size:    size,
 			Mode:    0644,
-			ModTime: time.Now(),
-		}), nil
-	}
-
-	// 5. Check if there's a write handler (file exists but is write-only).
-	if handler, _ := v.router.resolve(VerbWrite, filename); handler != nil {
-		return v.statToInfo(filename, &FileStat{
-			Size:    0,
-			Mode:    0644,
-			ModTime: time.Now(),
+			ModTime: v.router.bootTime,
 		}), nil
 	}
 
@@ -187,6 +176,14 @@ func (v *VFS) Rename(oldpath, newpath string) error {
 func (v *VFS) Remove(filename string) error {
 	filename = v.clean(filename)
 
+	// Pending files can be removed without a handler — they haven't been
+	// committed yet. This handles macOS resource fork files (._*) that get
+	// created and immediately removed.
+	if v.router.isPending(filename) {
+		v.router.removePending(filename)
+		return nil
+	}
+
 	handler, ctx := v.router.resolve(VerbRemove, filename)
 	if handler == nil {
 		return os.ErrPermission
@@ -199,7 +196,7 @@ func (v *VFS) Join(elem ...string) string {
 	return path.Join(elem...)
 }
 
-// TempFile is not supported in virtual filesystems.
+// TempFile is not supported.
 func (v *VFS) TempFile(dir, prefix string) (billy.File, error) {
 	return nil, os.ErrPermission
 }
@@ -209,31 +206,41 @@ func (v *VFS) TempFile(dir, prefix string) (billy.File, error) {
 // --------------------------------------------------------------------------
 
 // ReadDir returns the contents of a directory.
-// It checks for an explicit ListHandler first, then falls back to the
-// implicit directory tree (static children from registered routes).
 func (v *VFS) ReadDir(dirPath string) ([]os.FileInfo, error) {
 	dirPath = v.clean(dirPath)
 
-	// Normalize: try both with and without trailing slash for List matching.
 	listPath := dirPath
 	if !strings.HasSuffix(listPath, "/") {
 		listPath += "/"
 	}
 
-	// 1. Check for an explicit List handler.
 	if handler, ctx := v.router.resolve(VerbList, listPath); handler != nil {
 		entries, err := handler.(ListHandler)(ctx)
 		if err != nil {
 			return nil, err
 		}
-		infos := make([]os.FileInfo, len(entries))
-		for i, e := range entries {
-			infos[i] = &dirEntryInfo{entry: e}
+		infos := make([]os.FileInfo, 0, len(entries))
+		seen := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			infos = append(infos, &dirEntryInfo{entry: e})
+			seen[e.Name] = true
+		}
+		// Include pending files not already in the listing.
+		for _, name := range v.router.pendingChildren(dirPath) {
+			if !seen[name] {
+				infos = append(infos, &fileInfo{
+					name: name,
+					stat: FileStat{
+						Size:    0,
+						Mode:    0644,
+						ModTime: v.router.bootTime,
+					},
+				})
+			}
 		}
 		return infos, nil
 	}
 
-	// 2. Fall back to implicit children from the route tree.
 	children := v.router.implicitChildren(dirPath)
 	if len(children) == 0 && !v.router.isImplicitDir(dirPath) {
 		return nil, os.ErrNotExist
@@ -245,16 +252,14 @@ func (v *VFS) ReadDir(dirPath string) ([]os.FileInfo, error) {
 		childPath := path.Join(dirPath, name)
 		info, err := v.stat(childPath)
 		if err != nil {
-			// If stat fails, create a synthetic directory entry.
 			info = v.dirInfo(childPath)
 		}
 		infos = append(infos, info)
 	}
-
 	return infos, nil
 }
 
-// MkdirAll creates a directory (and parents). Calls MkdirHandler if registered.
+// MkdirAll creates a directory.
 func (v *VFS) MkdirAll(filename string, perm os.FileMode) error {
 	filename = v.clean(filename)
 
@@ -262,42 +267,37 @@ func (v *VFS) MkdirAll(filename string, perm os.FileMode) error {
 	if handler != nil {
 		return handler.(MkdirHandler)(ctx)
 	}
-
-	// If the directory is already implicit, succeed silently.
 	if v.router.isImplicitDir(filename) {
 		return nil
 	}
-
 	return os.ErrPermission
 }
 
 // --------------------------------------------------------------------------
-// billy.Symlink (not supported — return appropriate errors)
+// billy.Symlink (not supported)
 // --------------------------------------------------------------------------
 
-func (v *VFS) Lstat(filename string) (os.FileInfo, error) {
-	return v.Stat(filename)
-}
-
-func (v *VFS) Symlink(target, link string) error {
-	return os.ErrPermission
-}
-
-func (v *VFS) Readlink(link string) (string, error) {
-	return "", os.ErrInvalid
-}
+func (v *VFS) Lstat(filename string) (os.FileInfo, error) { return v.Stat(filename) }
+func (v *VFS) Symlink(target, link string) error          { return os.ErrPermission }
+func (v *VFS) Readlink(link string) (string, error)       { return "", os.ErrInvalid }
 
 // --------------------------------------------------------------------------
 // billy.Chroot
 // --------------------------------------------------------------------------
 
-func (v *VFS) Chroot(chrootPath string) (billy.Filesystem, error) {
+func (v *VFS) Chroot(p string) (billy.Filesystem, error) {
 	return nil, fmt.Errorf("fsrouter: chroot not supported")
 }
+func (v *VFS) Root() string { return "/" }
 
-func (v *VFS) Root() string {
-	return "/"
-}
+// --------------------------------------------------------------------------
+// billy.Change — no-ops so NFS SETATTR succeeds
+// --------------------------------------------------------------------------
+
+func (v *VFS) Chmod(name string, mode os.FileMode) error         { return nil }
+func (v *VFS) Lchown(name string, uid, gid int) error            { return nil }
+func (v *VFS) Chown(name string, uid, gid int) error             { return nil }
+func (v *VFS) Chtimes(name string, atime, mtime time.Time) error { return nil }
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -308,7 +308,6 @@ func (v *VFS) clean(p string) string {
 }
 
 func (v *VFS) statToInfo(name string, stat *FileStat) os.FileInfo {
-	base := path.Base(name)
 	mode := stat.Mode
 	if mode == 0 {
 		if stat.IsDir {
@@ -322,10 +321,10 @@ func (v *VFS) statToInfo(name string, stat *FileStat) os.FileInfo {
 	}
 	modTime := stat.ModTime
 	if modTime.IsZero() {
-		modTime = time.Now()
+		modTime = v.router.bootTime
 	}
 	return &fileInfo{
-		name: base,
+		name: path.Base(name),
 		stat: FileStat{
 			Size:    stat.Size,
 			Mode:    mode,
@@ -345,7 +344,7 @@ func (v *VFS) dirInfo(dirPath string) os.FileInfo {
 		stat: FileStat{
 			Size:    4096,
 			Mode:    os.ModeDir | 0755,
-			ModTime: time.Now(),
+			ModTime: v.router.bootTime,
 			IsDir:   true,
 		},
 	}

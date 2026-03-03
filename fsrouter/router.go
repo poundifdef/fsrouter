@@ -2,12 +2,13 @@ package fsrouter
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"path"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/rs/zerolog"
 	nfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 )
@@ -30,10 +31,10 @@ type Router struct {
 	// Route tables, keyed by verb.
 	reads   []*route
 	writes  []*route
+	creates []*route
 	stats   []*route
 	removes []*route
 	lists   []*route
-	creates []*route
 	mkdirs  []*route
 	renames []*route
 
@@ -42,11 +43,25 @@ type Router struct {
 	// "/a/b/c.txt" implicitly creates directories "/", "/a", "/a/b").
 	dirTree *dirNode
 
+	// pendingFiles tracks files that have been Create()'d but not yet written
+	// and committed. NFS separates creation from writing:
+	//   CREATE RPC → fs.Create() → file.Close() → fs.Lstat() (in SETATTR)
+	//   WRITE RPC  → fs.Stat()   → fs.OpenFile() → file.Write(data) → file.Close()
+	// The file must be visible to Stat/Lstat between these RPCs even though
+	// no data has been written yet and no WriteHandler has been called.
+	pendingMu    sync.Mutex
+	pendingFiles map[string]bool
+
+	// bootTime is a stable timestamp used as the default ModTime for all
+	// synthetic file/directory stats. Using a fixed time prevents NFS clients
+	// (and editors like vim) from seeing the mtime change on every Lstat poll.
+	bootTime time.Time
+
 	// Middleware applied to every handler invocation.
 	middleware []Middleware
 
-	// Logger for filesystem operations. Defaults to log.Default().
-	Logger *log.Logger
+	// Logger for filesystem operations.
+	Logger zerolog.Logger
 
 	// HandleCacheSize controls how many NFS file handles are cached.
 	// Defaults to 1024.
@@ -65,10 +80,10 @@ type route struct {
 
 // dirNode is a node in the implicit directory tree.
 type dirNode struct {
-	children  map[string]*dirNode
-	isDynamic bool   // true if this segment is a {param}
-	paramName string // non-empty if isDynamic
-	isExplicit bool  // true if a List/Mkdir handler is registered here
+	children   map[string]*dirNode
+	isDynamic  bool   // true if this segment is a {param}
+	paramName  string // non-empty if isDynamic
+	isExplicit bool   // true if a List/Mkdir handler is registered here
 }
 
 // New creates a new Router with sensible defaults.
@@ -77,8 +92,10 @@ func New() *Router {
 		dirTree: &dirNode{
 			children: make(map[string]*dirNode),
 		},
+		pendingFiles:    make(map[string]bool),
+		bootTime:        time.Now(),
 		HandleCacheSize: 1024,
-		Logger:          log.Default(),
+		Logger:          zerolog.Nop(),
 	}
 }
 
@@ -86,33 +103,45 @@ func New() *Router {
 // Route registration — the "verbs"
 // --------------------------------------------------------------------------
 
-// Read registers a handler invoked when a file at the given pattern is read.
-// This is the filesystem equivalent of http.HandleFunc with GET.
+// Read registers a handler for pread(2) — called for each NFS READ RPC.
 //
-//	router.Read("/greet/{name}.txt", func(c *Context) ([]byte, error) {
-//	    return []byte("Hello, " + c.Param("name") + "!"), nil
+//	router.Read("/users/{id}.json", func(c *Context, offset int64, length int) ([]byte, error) {
+//	    data, _ := json.Marshal(db.Get(c.Param("id")))
+//	    end := offset + int64(length)
+//	    if end > int64(len(data)) { end = int64(len(data)) }
+//	    return data[offset:end], nil
 //	})
 func (r *Router) Read(pattern string, handler ReadHandler) {
 	r.addRoute(VerbRead, pattern, handler)
 }
 
-// Write registers a handler invoked when a file at the given pattern is written and closed.
-// The handler receives the complete data that was written.
+// Write registers a handler for pwrite(2) — called for each NFS WRITE RPC.
+// Called for writes to both new and existing files.
 //
-//	router.Write("/notes/{id}.txt", func(c *Context, data []byte) error {
-//	    return db.Save(c.Param("id"), data)
+//	router.Write("/users/{id}.json", func(c *Context, data []byte, offset int64) error {
+//	    return db.Put(c.Param("id"), data)
 //	})
 func (r *Router) Write(pattern string, handler WriteHandler) {
 	r.addRoute(VerbWrite, pattern, handler)
 }
 
-// Stat registers a handler that returns metadata about a file.
-// If no Stat handler is registered, fsrouter synthesizes metadata by calling
-// the Read handler (if one exists) and reporting the result length.
+// Create registers a handler for file creation — called with the complete file
+// contents once the client finishes writing.
+// If the client creates an empty file, data will be nil.
 //
-//	router.Stat("/notes/{id}.txt", func(c *Context) (*FileStat, error) {
-//	    size, _ := db.Size(c.Param("id"))
-//	    return &FileStat{Size: size, Mode: 0644}, nil
+//	router.Create("/users/{id}.json", func(c *Context, data []byte) error {
+//	    return db.Insert(c.Param("id"), data)
+//	})
+func (r *Router) Create(pattern string, handler CreateHandler) {
+	r.addRoute(VerbCreate, pattern, handler)
+}
+
+// Stat registers a handler for stat(2) — returns file metadata.
+// If not registered, fsrouter returns a synthetic stat for any path that has
+// a Read or Write handler.
+//
+//	router.Stat("/users/{id}.json", func(c *Context) (*FileStat, error) {
+//	    return &FileStat{Size: 1024, Mode: 0644}, nil
 //	})
 func (r *Router) Stat(pattern string, handler StatHandler) {
 	r.addRoute(VerbStat, pattern, handler)
@@ -140,13 +169,6 @@ func (r *Router) Remove(pattern string, handler RemoveHandler) {
 //	})
 func (r *Router) List(pattern string, handler ListHandler) {
 	r.addRoute(VerbList, pattern, handler)
-}
-
-// Create registers a handler invoked when a new file is created.
-// Return an error to reject the creation. On success, the subsequent write
-// data will be delivered to the matching Write handler.
-func (r *Router) Create(pattern string, handler CreateHandler) {
-	r.addRoute(VerbCreate, pattern, handler)
 }
 
 // Mkdir registers a handler invoked when a directory is created.
@@ -189,14 +211,24 @@ type Group struct {
 	prefix string
 }
 
-func (g *Group) Read(pattern string, handler ReadHandler)       { g.router.Read(g.prefix+pattern, handler) }
-func (g *Group) Write(pattern string, handler WriteHandler)     { g.router.Write(g.prefix+pattern, handler) }
-func (g *Group) Stat(pattern string, handler StatHandler)       { g.router.Stat(g.prefix+pattern, handler) }
-func (g *Group) Remove(pattern string, handler RemoveHandler)   { g.router.Remove(g.prefix+pattern, handler) }
-func (g *Group) List(pattern string, handler ListHandler)       { g.router.List(g.prefix+pattern, handler) }
-func (g *Group) Create(pattern string, handler CreateHandler)   { g.router.Create(g.prefix+pattern, handler) }
-func (g *Group) Mkdir(pattern string, handler MkdirHandler)     { g.router.Mkdir(g.prefix+pattern, handler) }
-func (g *Group) Rename(pattern string, handler RenameHandler)   { g.router.Rename(g.prefix+pattern, handler) }
+func (g *Group) Read(pattern string, handler ReadHandler) { g.router.Read(g.prefix+pattern, handler) }
+func (g *Group) Write(pattern string, handler WriteHandler) {
+	g.router.Write(g.prefix+pattern, handler)
+}
+func (g *Group) Create(pattern string, handler CreateHandler) {
+	g.router.Create(g.prefix+pattern, handler)
+}
+func (g *Group) Stat(pattern string, handler StatHandler) { g.router.Stat(g.prefix+pattern, handler) }
+func (g *Group) Remove(pattern string, handler RemoveHandler) {
+	g.router.Remove(g.prefix+pattern, handler)
+}
+func (g *Group) List(pattern string, handler ListHandler) { g.router.List(g.prefix+pattern, handler) }
+func (g *Group) Mkdir(pattern string, handler MkdirHandler) {
+	g.router.Mkdir(g.prefix+pattern, handler)
+}
+func (g *Group) Rename(pattern string, handler RenameHandler) {
+	g.router.Rename(g.prefix+pattern, handler)
+}
 
 // Group creates a nested group.
 func (g *Group) Group(prefix string) *Group {
@@ -225,11 +257,12 @@ func (r *Router) Serve(addr string) error {
 // ServeListener starts an NFS server on an existing net.Listener.
 // This is useful when you need control over the listener (e.g., for testing).
 func (r *Router) ServeListener(listener net.Listener) error {
-	fs := r.Filesystem()
-	handler := nfshelper.NewNullAuthHandler(fs)
+	vfs := r.Filesystem()
+	loggingVFS := NewLoggingVFS(vfs, r.Logger.With().Str("layer", "vfs").Logger())
+	handler := nfshelper.NewNullAuthHandler(loggingVFS)
 	cacheHandler := nfshelper.NewCachingHandler(handler, r.HandleCacheSize)
 
-	r.Logger.Printf("fsrouter: NFS server listening on %s", listener.Addr())
+	r.Logger.Info().Str("addr", listener.Addr().String()).Msg("NFS server listening")
 	return nfs.Serve(listener, cacheHandler)
 }
 
@@ -237,6 +270,48 @@ func (r *Router) ServeListener(listener net.Listener) error {
 // Useful if you want to embed the filesystem in another context without NFS.
 func (r *Router) Filesystem() *VFS {
 	return &VFS{router: r}
+}
+
+// --------------------------------------------------------------------------
+// Pending file management (survives across VFS instances)
+// --------------------------------------------------------------------------
+
+func (r *Router) addPending(path string) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	r.pendingFiles[path] = true
+}
+
+func (r *Router) removePending(path string) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	delete(r.pendingFiles, path)
+}
+
+func (r *Router) isPending(path string) bool {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	return r.pendingFiles[path]
+}
+
+// pendingChildren returns the base names of pending files directly under dirPath.
+func (r *Router) pendingChildren(dirPath string) []string {
+	prefix := dirPath + "/"
+	if dirPath == "/" {
+		prefix = "/"
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	var names []string
+	for p := range r.pendingFiles {
+		if strings.HasPrefix(p, prefix) {
+			rest := p[len(prefix):]
+			if rest != "" && !strings.Contains(rest, "/") {
+				names = append(names, rest)
+			}
+		}
+	}
+	return names
 }
 
 // --------------------------------------------------------------------------
@@ -255,14 +330,14 @@ func (r *Router) addRoute(verb Verb, rawPattern string, handler interface{}) {
 		r.reads = append(r.reads, rt)
 	case VerbWrite:
 		r.writes = append(r.writes, rt)
+	case VerbCreate:
+		r.creates = append(r.creates, rt)
 	case VerbStat:
 		r.stats = append(r.stats, rt)
 	case VerbRemove:
 		r.removes = append(r.removes, rt)
 	case VerbList:
 		r.lists = append(r.lists, rt)
-	case VerbCreate:
-		r.creates = append(r.creates, rt)
 	case VerbMkdir:
 		r.mkdirs = append(r.mkdirs, rt)
 	case VerbRename:
@@ -313,14 +388,14 @@ func (r *Router) resolve(verb Verb, filePath string) (interface{}, *Context) {
 		routes = r.reads
 	case VerbWrite:
 		routes = r.writes
+	case VerbCreate:
+		routes = r.creates
 	case VerbStat:
 		routes = r.stats
 	case VerbRemove:
 		routes = r.removes
 	case VerbList:
 		routes = r.lists
-	case VerbCreate:
-		routes = r.creates
 	case VerbMkdir:
 		routes = r.mkdirs
 	case VerbRename:
@@ -364,12 +439,43 @@ func (r *Router) isImplicitDir(filePath string) bool {
 			}
 		}
 		if !found {
-			return false
+			// Not found in the tree — but if any glob route's static prefix
+			// covers this path, it's a valid intermediate directory. NFS resolves
+			// paths segment-by-segment, so /echo/foo/bar must appear as a dir
+			// for NFS to eventually reach the glob handler at /echo/{path...}.
+			return r.isUnderGlob(filePath)
 		}
 	}
 
 	// It's a directory if it has children or is explicitly registered.
-	return len(node.children) > 0 || node.isExplicit
+	if len(node.children) > 0 || node.isExplicit {
+		return true
+	}
+
+	// The node exists in the tree but has no static children — check if
+	// any glob route makes this a valid directory. For example, registering
+	// "/echo/{path...}" creates the "echo" node but registerDirs breaks
+	// before adding glob children, so the node looks like a leaf.
+	return r.isUnderGlob(filePath)
+}
+
+// isUnderGlob checks if filePath falls under any registered glob route's
+// static prefix. For a glob route like "/echo/{path...}", the static prefix
+// is "/echo", so any path like "/echo/foo" or "/echo/foo/bar" is a valid
+// intermediate directory that NFS needs to traverse.
+func (r *Router) isUnderGlob(filePath string) bool {
+	allRoutes := [][]*route{r.reads, r.writes, r.creates, r.stats, r.removes, r.lists, r.mkdirs, r.renames}
+	for _, routes := range allRoutes {
+		for _, rt := range routes {
+			if rt.pattern.hasGlob() {
+				prefix := rt.pattern.staticPrefix()
+				if strings.HasPrefix(filePath, prefix+"/") || filePath == prefix {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // implicitChildren returns the static child names for a given directory path.
